@@ -101,6 +101,155 @@ import Testing
     #expect(store.terminalOutputQueuesBySurfaceID[surfaceID]?.isIdle == true)
 }
 
+@MainActor
+@Test func staleReplayFinishCannotFlushNewReplayBuffer() async throws {
+    let store = MobileShellComposite.preview()
+    let surfaceID = "terminal"
+    let streamToken = UUID()
+    let stream = AsyncStream<MobileTerminalOutputChunk> { continuation in
+        store.terminalByteContinuationsBySurfaceID[surfaceID] = continuation
+        store.terminalOutputStreamTokensBySurfaceID[surfaceID] = streamToken
+        store.terminalOutputQueuesBySurfaceID[surfaceID] = TerminalOutputDeliveryQueue()
+    }
+    _ = stream
+
+    let staleReplayID = store.debugMarkTerminalReplayInFlightForTesting(surfaceID: surfaceID)
+    let staleLiveFrame = try MobileTerminalRenderGridFrame.fromPlainRows(
+        surfaceID: surfaceID,
+        stateSeq: 2,
+        columns: 16,
+        rows: 2,
+        text: "stale\nlive",
+        full: false,
+        changedRows: [0, 1]
+    )
+    store.deliverAuthoritativeTerminalRenderGrid(staleLiveFrame, source: "event")
+    store.debugCancelTerminalReplayForTesting(surfaceID: surfaceID)
+
+    let currentReplayID = store.debugMarkTerminalReplayInFlightForTesting(surfaceID: surfaceID)
+    let currentLiveFrame = try MobileTerminalRenderGridFrame.fromPlainRows(
+        surfaceID: surfaceID,
+        stateSeq: 4,
+        columns: 16,
+        rows: 2,
+        text: "current\nlive",
+        full: false,
+        changedRows: [0, 1]
+    )
+    store.deliverAuthoritativeTerminalRenderGrid(currentLiveFrame, source: "event")
+
+    let staleReplayFrame = try MobileTerminalRenderGridFrame(
+        surfaceID: surfaceID,
+        stateSeq: 1,
+        columns: 16,
+        rows: 2,
+        rowSpans: [
+            .init(row: 0, column: 0, text: "old-vp0"),
+            .init(row: 1, column: 0, text: "old-vp1"),
+        ],
+        scrollbackRows: 1,
+        scrollbackSpans: [
+            .init(row: 0, column: 0, text: "old-scroll"),
+        ]
+    )
+    store.debugFinishTerminalReplayForTesting(
+        surfaceID: surfaceID,
+        replayID: staleReplayID,
+        replayFrame: staleReplayFrame
+    )
+
+    #expect(
+        store.terminalOutputQueuesBySurfaceID[surfaceID]?.isIdle == true,
+        "a stale replay must not clear the newer replay barrier or deliver old scrollback"
+    )
+
+    let currentReplayFrame = try MobileTerminalRenderGridFrame(
+        surfaceID: surfaceID,
+        stateSeq: 3,
+        columns: 16,
+        rows: 2,
+        rowSpans: [
+            .init(row: 0, column: 0, text: "new-vp0"),
+            .init(row: 1, column: 0, text: "new-vp1"),
+        ],
+        scrollbackRows: 1,
+        scrollbackSpans: [
+            .init(row: 0, column: 0, text: "new-scroll"),
+        ]
+    )
+    store.debugFinishTerminalReplayForTesting(
+        surfaceID: surfaceID,
+        replayID: currentReplayID,
+        replayFrame: currentReplayFrame
+    )
+
+    let queueAfterReplay = try #require(store.terminalOutputQueuesBySurfaceID[surfaceID])
+    #expect(queueAfterReplay.isIdle == false)
+    #expect(queueAfterReplay.pendingCount == 1)
+    store.terminalOutputDidProcess(surfaceID: surfaceID, streamToken: streamToken)
+
+    let queueAfterReplayAck = try #require(store.terminalOutputQueuesBySurfaceID[surfaceID])
+    #expect(queueAfterReplayAck.isIdle == false)
+    #expect(queueAfterReplayAck.pendingCount == 0)
+    store.terminalOutputDidProcess(surfaceID: surfaceID, streamToken: streamToken)
+    #expect(store.terminalOutputQueuesBySurfaceID[surfaceID]?.isIdle == true)
+}
+
+@MainActor
+@Test func replayOverflowFlushesBufferedTailWithoutStartingReplayLoop() async throws {
+    let store = MobileShellComposite.preview()
+    let surfaceID = "terminal"
+    let streamToken = UUID()
+    let stream = AsyncStream<MobileTerminalOutputChunk> { continuation in
+        store.terminalByteContinuationsBySurfaceID[surfaceID] = continuation
+        store.terminalOutputStreamTokensBySurfaceID[surfaceID] = streamToken
+        store.terminalOutputQueuesBySurfaceID[surfaceID] = TerminalOutputDeliveryQueue()
+    }
+    _ = stream
+
+    store.debugMarkTerminalReplayInFlightForTesting(surfaceID: surfaceID)
+    let liveFrameCount = MobileShellComposite.maxRenderGridFramesBufferedDuringReplay + 2
+    for index in 0..<liveFrameCount {
+        let frame = try MobileTerminalRenderGridFrame.fromPlainRows(
+            surfaceID: surfaceID,
+            stateSeq: UInt64(index + 2),
+            columns: 16,
+            rows: 2,
+            text: "live \(index)\nviewport",
+            full: false,
+            changedRows: [0, 1]
+        )
+        store.deliverAuthoritativeTerminalRenderGrid(frame, source: "event")
+    }
+
+    let replayFrame = try MobileTerminalRenderGridFrame(
+        surfaceID: surfaceID,
+        stateSeq: 1,
+        columns: 16,
+        rows: 2,
+        rowSpans: [
+            .init(row: 0, column: 0, text: "replay-vp0"),
+            .init(row: 1, column: 0, text: "replay-vp1"),
+        ],
+        scrollbackRows: 1,
+        scrollbackSpans: [
+            .init(row: 0, column: 0, text: "replay-scroll"),
+        ]
+    )
+    store.debugFinishTerminalReplayForTesting(surfaceID: surfaceID, replayFrame: replayFrame)
+
+    let queueAfterReplay = try #require(store.terminalOutputQueuesBySurfaceID[surfaceID])
+    #expect(queueAfterReplay.isIdle == false)
+    #expect(queueAfterReplay.pendingCount == 1, "the retained live tail should queue behind the replay instead of starting another replay")
+    #expect(store.terminalReplayIDsInFlightBySurfaceID[surfaceID] == nil)
+    #expect(store.terminalRenderGridFramesBufferedDuringReplayBySurfaceID[surfaceID] == nil)
+    store.terminalOutputDidProcess(surfaceID: surfaceID, streamToken: streamToken)
+
+    let queueAfterReplayAck = try #require(store.terminalOutputQueuesBySurfaceID[surfaceID])
+    #expect(queueAfterReplayAck.isIdle == false)
+    #expect(queueAfterReplayAck.pendingCount == 0)
+}
+
 @Test func terminalOutputQueueCoalescesReplaceableViewportFramesBehindBackpressure() {
     var queue = TerminalOutputDeliveryQueue()
     let inFlight = TerminalOutputDelivery(bytes: Data("in-flight".utf8), replaceable: false)
