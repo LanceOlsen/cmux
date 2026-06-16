@@ -274,9 +274,14 @@ final class ComposerDictationController {
 
         let inputNode = audioEngine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
-        // A zero-channel format means there is no usable input route; bail rather
-        // than crash installing a tap with an invalid format.
-        guard format.channelCount > 0 else {
+        // `installTap` raises an UNCATCHABLE Obj-C exception
+        // (`IsFormatSampleRateAndChannelCountValid`) when the input format is
+        // invalid, which a Swift `do/catch` cannot trap. The input node can hand
+        // back a format with a zero sample rate or zero channels when there is no
+        // usable input route yet (e.g. the session's input route is still
+        // settling, or the mic is claimed by another app), so validate BOTH
+        // dimensions and fail the start gracefully instead of crashing.
+        guard format.channelCount > 0, format.sampleRate > 0 else {
             failStart()
             return
         }
@@ -306,10 +311,10 @@ final class ComposerDictationController {
             Task { @MainActor in
                 guard let self else { return }
                 if let transcript {
-                    self.onText?(ComposerDictationTextMerge.merged(
+                    self.onText?(ComposerDictationTextMerge(
                         base: self.baseText,
                         transcript: transcript
-                    ))
+                    ).merged)
                 }
                 // A final result or an error (end-of-stream, recognition failure)
                 // settles the session so the mic does not stay hot. If a graceful
